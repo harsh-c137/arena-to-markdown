@@ -24,8 +24,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Create keep-alive commit
-        run: git commit --allow-empty -m "chore: keep Streamlit app awake"
+      - name: Commit empty change
+        run: |
+          git commit --allow-empty -m "chore: keep Streamlit app awake"
 
       - name: Push to main
         run: git push origin main
