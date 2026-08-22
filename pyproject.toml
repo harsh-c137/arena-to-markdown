@@ -1,0 +1,13 @@
+[project]
+name = "arena-chat-app"
+version = "0.1.0"
+description = "Streamlit app that turns saved arena.ai Direct chats into Markdown"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+    "streamlit>=1.40.0",
+]
+
+[tool.uv]
+python-preference = "only-managed"
