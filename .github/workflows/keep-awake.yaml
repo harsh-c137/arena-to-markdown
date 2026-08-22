@@ -1,0 +1,31 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    # Runs every 30 minutes so Streamlit Community Cloud does not spin the app down.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create keep-alive commit
+        run: git commit --allow-empty -m "chore: keep Streamlit app awake"
+
+      - name: Push to main
+        run: git push origin main
