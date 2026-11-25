@@ -1,6 +1,7 @@
 .venv/
 venv-arena-to-md/
 __pycache__/
+*.egg-info/
 *.pyc
 .streamlit/secrets.toml
 for-llm-context/
