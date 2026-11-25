@@ -52,6 +52,26 @@ st.markdown(
     .arena-alert p {
         margin: 0.5rem 0 0.1rem 0;
     }
+    [data-testid="stCheckbox"],
+    .stCheckbox {
+        background-color: rgba(28, 131, 225, 0.12);
+        border: 1.5px solid rgba(28, 131, 225, 0.4);
+        border-radius: 0.5rem;
+        padding: 0.85rem 1.1rem;
+        margin: 0.25rem 0 1rem 0;
+    }
+    [data-testid="stCheckbox"] label,
+    .stCheckbox label {
+        font-size: 1.12rem;
+        font-weight: 600;
+        line-height: 1.45;
+    }
+    [data-testid="stCheckbox"] label p,
+    .stCheckbox label p {
+        margin: 0;
+        font-size: 1.12rem;
+        font-weight: 600;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -77,7 +97,7 @@ st.markdown(
 <ul>
   <li>Upload <strong>"Direct"</strong> chats only. No "Side by Side", "Agent Mode" or "Battle Mode" chats yet</li>
   <li>If Arena slipped a random two-model comparison into a Direct chat, both replies are kept and labeled A and B</li>
-  <li>Keep or drop the model's thought process (reasoning) with the checkbox below</li>
+  <li>Keep or drop the model's thought process with the highlighted 🧠 checkbox below</li>
 </ul>
 </div>
     """,
@@ -126,7 +146,7 @@ else:
             st.stop()
 
 keep_reasoning = st.checkbox(
-    "Include the model's thought process (reasoning)",
+    "🧠 Include the model's thought process (reasoning)",
     help="Model replies on Arena can come with their chain of thought. "
     "Keep it in the Markdown or export only the final answers.",
 )
