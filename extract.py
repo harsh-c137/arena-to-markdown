@@ -2,6 +2,12 @@
 
 Keeps both replies when Arena injects a one-off two-model comparison, and can
 include or drop each assistant reply's reasoning (thought process).
+
+The chat lives in Next.js flight payloads (``self.__next_f.push`` script
+calls). The chunks are concatenated into one stream and parsed row by row:
+Next.js may split a single row across several push chunks, and text rows
+(``id:T<len>,``) carry raw text of an exact UTF-16 length that can itself
+contain newlines, so rows cannot be recovered reliably from one chunk alone.
 """
 
 from __future__ import annotations
@@ -13,13 +19,17 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 PUSH_RE = re.compile(r"""self\.__next_f\.push\(\[1,"((?:\\.|[^"\\])*)"\]\)""")
-T_STRING_RE = re.compile(r"^([0-9a-f]+):T[0-9a-f]+,$")
 REF_RE = re.compile(r"^\$([0-9a-f]+)$")
+ROW_ID_RE = re.compile(r"[0-9a-f]+")
+TEXT_ROW_RE = re.compile(r"T(\d+),")
+LEGACY_TEXT_ROW_RE = re.compile(r"([0-9a-f]+):T[0-9a-f]+,")
 VIEW_SOURCE_MARKERS = ("line-content", "line-number", "html-tag")
 SAVED_FROM_RE = re.compile(
     r"<!--\s*saved from url=\([^)]*\)(https?://[^>\s]+?)\s*-->",
     re.I,
 )
+
+FlightRow = tuple[str, str, str]  # (row id, kind, value); kind: "json" | "text"
 
 
 def looks_like_view_source(html: str) -> bool:
@@ -56,38 +66,115 @@ def flight_payloads(html: str) -> list[str]:
     return [decode_js_string(chunk) for chunk in PUSH_RE.findall(html)]
 
 
-def flight_rows(payloads: list[str]) -> list[str]:
-    """Flatten flight push chunks into individual ``id:json`` rows.
+def flight_stream(payloads: list[str]) -> str:
+    """Concatenate flight push chunks, in document order, into one stream."""
+    return "".join(payloads)
 
-    Older saves push one row per chunk; newer ones (like current arena.ai)
-    pack several newline-separated rows into a single chunk. Row boundaries
-    are newline-delimited either way, so splitting every chunk on newlines
-    yields one flat row list for both formats.
+
+def _take_utf16(stream: str, start: int, units: int) -> tuple[str, int]:
+    """Consume ``units`` UTF-16 code units (JS ``string.length``) from start."""
+    end = start
+    while end < len(stream) and units > 0:
+        units -= 2 if ord(stream[end]) > 0xFFFF else 1
+        end += 1
+    return stream[start:end], end
+
+
+def parse_flight_stream(stream: str) -> list[FlightRow]:
+    """Split the flight stream into ``(id, kind, value)`` rows.
+
+    JSON rows end at their next newline (their text never contains a raw
+    one). Text rows carry their length after ``T``, in UTF-16 code units, so
+    their value may contain anything, including newlines that would otherwise
+    look like row boundaries. Lines that do not start with a ``<hex-id>:``
+    row id are skipped.
     """
-    rows: list[str] = []
-    for payload in payloads:
-        rows.extend(payload.splitlines())
+    rows: list[FlightRow] = []
+    i = 0
+    size = len(stream)
+    while i < size:
+        if stream[i] == "\n":
+            i += 1
+            continue
+        line_end = stream.find("\n", i)
+        if line_end == -1:
+            line_end = size
+        colon = stream.find(":", i)
+        if colon == -1 or colon > line_end:
+            i = line_end + 1 if line_end < size else size
+            continue
+        row_id = stream[i:colon]
+        if not ROW_ID_RE.fullmatch(row_id):
+            i = line_end + 1 if line_end < size else size
+            continue
+        text_match = TEXT_ROW_RE.match(stream, colon + 1)
+        if text_match:
+            value, end = _take_utf16(
+                stream, text_match.end(), int(text_match.group(1))
+            )
+            rows.append((row_id, "text", value))
+            i = end
+        else:
+            value_end = stream.find("\n", colon + 1)
+            if value_end == -1:
+                value_end = size
+            rows.append((row_id, "json", stream[colon + 1 : value_end]))
+            i = value_end + 1 if value_end < size else size
     return rows
 
 
-def text_chunk_table(payloads: list[str]) -> dict[str, str]:
-    """Map ``$id`` text-chunk references to their text.
+def flight_rows(payloads: list[str]) -> list[FlightRow]:
+    """Parse the flight stream into rows, falling back to legacy saves.
 
-    Older saves push the marker and its (possibly multi-line) text as two
-    separate chunks; newer ones pack several rows into a single chunk. Scan
-    both views so either format resolves.
+    Current arena.ai saves pack several newline-separated rows into each push
+    chunk and may split one row across chunks, so rows are parsed from the
+    chunks concatenated in order. Older saves push exactly one row per chunk
+    with no separators between chunks; if the stream reading yields no
+    conversation state, fall back to that per-chunk reading.
     """
-    rows = flight_rows(payloads)
-    table: dict[str, str] = {}
-    for index, row in enumerate(rows):
-        match = T_STRING_RE.fullmatch(row.strip())
-        if match and index + 1 < len(rows):
-            table[match.group(1)] = rows[index + 1]
+    stream_rows = parse_flight_stream(flight_stream(payloads))
+    try:
+        conversation_state(stream_rows)
+    except ValueError:
+        legacy_rows = parse_flight_legacy(payloads)
+        try:
+            conversation_state(legacy_rows)
+        except ValueError:
+            pass
+        else:
+            return legacy_rows
+    return stream_rows
+
+
+def parse_flight_legacy(payloads: list[str]) -> list[FlightRow]:
+    """Read one-row-per-chunk (older) saves: marker chunk + value chunk."""
+    rows: list[FlightRow] = []
     for index, payload in enumerate(payloads):
-        match = T_STRING_RE.fullmatch(payload.strip())
-        if match and index + 1 < len(payloads):
-            table[match.group(1)] = payloads[index + 1]
-    return table
+        stripped = payload.strip()
+        if not stripped:
+            continue
+        match = LEGACY_TEXT_ROW_RE.fullmatch(stripped)
+        if match:
+            if index + 1 < len(payloads):
+                rows.append((match.group(1), "text", payloads[index + 1]))
+            continue
+        for line in payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            colon = line.find(":")
+            if colon <= 0:
+                continue
+            row_id = line[:colon]
+            if not ROW_ID_RE.fullmatch(row_id):
+                continue
+            rows.append((row_id, "json", line[colon + 1 :]))
+    return rows
+
+
+def text_chunk_table(rows: list[FlightRow]) -> dict[str, str]:
+    """Map ``$id`` text-chunk references to their text row values."""
+    return {row_id: value for row_id, kind, value in rows if kind == "text"}
 
 
 def resolve_content(content: Any, chunks: dict[str, str]) -> str:
@@ -99,16 +186,12 @@ def resolve_content(content: Any, chunks: dict[str, str]) -> str:
     return content
 
 
-def json_after_flight_id(payload: str) -> Any | None:
-    stripped = payload.lstrip()
-    colon = stripped.find(":")
-    if colon == -1:
-        return None
-    body = stripped[colon + 1 :]
-    if not body or body[0] not in "[{":
+def load_json(value: str) -> Any | None:
+    """Parse a flight JSON row value (``[...]`` or ``{...}``)."""
+    if not value or value[0] not in "[{":
         return None
     try:
-        return json.loads(body)
+        return json.loads(value)
     except json.JSONDecodeError:
         return None
 
@@ -151,11 +234,11 @@ def is_model_catalog(obj: Any) -> bool:
     )
 
 
-def conversation_state(rows: list[str]) -> dict[str, Any]:
-    for row in rows:
-        if '"messages"' not in row or '"role"' not in row:
+def conversation_state(rows: list[FlightRow]) -> dict[str, Any]:
+    for _row_id, kind, value in rows:
+        if kind != "json" or '"messages"' not in value or '"role"' not in value:
             continue
-        parsed = json_after_flight_id(row)
+        parsed = load_json(value)
         if parsed is None:
             continue
         found = walk_find(parsed, is_conversation_state)
@@ -174,20 +257,22 @@ def conversation_state(rows: list[str]) -> dict[str, Any]:
     )
 
 
-def model_names(rows: list[str]) -> dict[str, str]:
+def model_names(rows: list[FlightRow]) -> dict[str, str]:
     names: dict[str, str] = {}
-    for row in rows:
-        if '"initialModels"' not in row:
+    for _row_id, kind, value in rows:
+        if kind != "json" or '"initialModels"' not in value:
             continue
-        parsed = json_after_flight_id(row)
+        parsed = load_json(value)
         if parsed is None:
             continue
         catalog = walk_find(parsed, is_model_catalog)
         if catalog is None:
             continue
         for model in catalog["initialModels"]:
+            if not isinstance(model, dict):
+                continue
             model_id = model.get("id")
-            if not model_id:
+            if not isinstance(model_id, str) or not model_id:
                 continue
             names[model_id] = (
                 model.get("displayName")
@@ -208,44 +293,35 @@ def chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def heading_for(message: dict[str, Any], names: dict[str, str]) -> str:
-    if message.get("role") == "user":
-        return "You"
-    model_id = message.get("modelId")
-    return names.get(model_id, "Assistant") if model_id else "Assistant"
+def text_blocks(value: Any) -> list[str]:
+    """Text from a content value: a string or a list of text blocks."""
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    texts: list[str] = []
+    for block in value:
+        if isinstance(block, str):
+            texts.append(block)
+        elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+    return texts
 
 
-def attachments_markdown(message: dict[str, Any]) -> str:
-    attachments = message.get("experimental_attachments") or []
-    if not attachments:
-        return ""
-    lines = ["**Attachments:**"]
-    for attachment in attachments:
-        name = attachment.get("name") or "file"
-        url = attachment.get("url")
-        if url:
-            lines.append(f"- [{name}]({url})")
-        else:
-            lines.append(f"- {name}")
-    return "\n".join(lines) + "\n"
+def message_content(message: dict[str, Any], chunks: dict[str, str]) -> str:
+    """Best-effort text of a message's content: string, ``$id`` ref, or blocks."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return resolve_content(content, chunks)
+    return "\n\n".join(text_blocks(content))
 
 
 def reasoning_text(message: dict[str, Any], chunks: dict[str, str]) -> str:
-    """Return the message's reasoning (thought process) text, if any.
-
-    Handles plain strings, ``$id`` references into the flight text chunks, and
-    the rare list-of-blocks shape (blocks with a ``text`` key).
-    """
+    """Return the message's reasoning (thought process) text, if any."""
     value = message.get("reasoning")
-    if isinstance(value, list):
-        value = "\n\n".join(
-            block["text"]
-            for block in value
-            if isinstance(block, dict) and isinstance(block.get("text"), str)
-        )
-    if not isinstance(value, str):
-        return ""
-    return resolve_content(value, chunks).strip()
+    if isinstance(value, str):
+        return resolve_content(value, chunks).strip()
+    return "\n\n".join(text_blocks(value)).strip()
 
 
 def reasoning_block(thought: str) -> str:
@@ -254,6 +330,36 @@ def reasoning_block(thought: str) -> str:
         ">" if not line.strip() else f"> {line}" for line in thought.splitlines()
     )
     return f"**Thought process**\n\n{quoted}"
+
+
+def heading_for(message: dict[str, Any], names: dict[str, str]) -> str:
+    if message.get("role") == "user":
+        return "You"
+    model_id = message.get("modelId")
+    if not isinstance(model_id, str) or not model_id:
+        return "Assistant"
+    return names.get(model_id, "Assistant")
+
+
+def attachments_markdown(message: dict[str, Any]) -> str:
+    attachments = message.get("experimental_attachments") or []
+    if isinstance(attachments, dict):
+        attachments = list(attachments.values())
+    if not isinstance(attachments, list):
+        return ""
+    lines = ["**Attachments:**"]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        name = attachment.get("name") or "file"
+        url = attachment.get("url")
+        if url:
+            lines.append(f"- [{name}]({url})")
+        else:
+            lines.append(f"- {name}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def source_url(html: str, saved_from: str | None, state: dict[str, Any]) -> str | None:
@@ -289,7 +395,10 @@ def to_markdown(
     keep_reasoning: bool = False,
 ) -> str:
     header: list[str] = []
-    title = (state.get("title") or "Arena chat").strip().splitlines()[0]
+    title = state.get("title") or "Arena chat"
+    if not isinstance(title, str):
+        title = str(title)
+    title = title.strip().splitlines()[0] if title.strip() else "Arena chat"
     if len(title) > 80:
         title = title[:77].rstrip() + "..."
     header.append(f"# {title}")
@@ -306,14 +415,16 @@ def to_markdown(
         next_role = (
             messages[index + 1].get("role") if index + 1 < len(messages) else None
         )
+        position = message.get("participantPosition")
         if (
             role == "assistant"
-            and message.get("participantPosition") in {"a", "b"}
+            and isinstance(position, str)
+            and position in {"a", "b"}
             and (prev_role == "assistant" or next_role == "assistant")
         ):
-            heading = f"{heading} ({message['participantPosition'].upper()})"
+            heading = f"{heading} ({position.upper()})"
 
-        body = resolve_content(message.get("content"), chunks).strip()
+        body = message_content(message, chunks).strip()
         files = attachments_markdown(message)
         block = f"## {heading}\n\n"
         if files:
@@ -344,13 +455,21 @@ def html_to_markdown(
             "No arena.ai chat payload found. Upload a saved Direct chat HTML file."
         )
 
-    rows = flight_rows(payloads)
-    chunks = text_chunk_table(payloads)
-    state = conversation_state(rows)
-    names = model_names(rows)
-    url = source_url(html, saved_from, state)
-    messages = chat_messages(state.get("messages") or [])
-    markdown = to_markdown(state, chunks, names, url, keep_reasoning)
+    try:
+        rows = flight_rows(payloads)
+        chunks = text_chunk_table(rows)
+        state = conversation_state(rows)
+        names = model_names(rows)
+        url = source_url(html, saved_from, state)
+        messages = chat_messages(state.get("messages") or [])
+        markdown = to_markdown(state, chunks, names, url, keep_reasoning)
+    except ValueError:
+        raise
+    except Exception as exc:  # keep the app's error box clean and diagnosable
+        raise ValueError(
+            f"Could not extract this chat ({type(exc).__name__}: {exc}). "
+            "Save the Direct chat page (or its view-source HTML) and try again."
+        ) from exc
     stats = {
         "user_messages": sum(1 for message in messages if message.get("role") == "user"),
         "assistant_messages": sum(
