@@ -1,4 +1,6 @@
 .venv/
+venv-arena-to-md/
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
+for-llm-context/
