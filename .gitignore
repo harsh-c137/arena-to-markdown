@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .streamlit/secrets.toml
 for-llm-context/
+.DS_Store

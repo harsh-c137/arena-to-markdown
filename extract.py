@@ -1,6 +1,7 @@
 """Extract an arena.ai Direct-chat HTML save into Markdown.
 
-Keeps both replies when Arena injects a one-off two-model comparison.
+Keeps both replies when Arena injects a one-off two-model comparison, and can
+include or drop each assistant reply's reasoning (thought process).
 """
 
 from __future__ import annotations
@@ -55,8 +56,33 @@ def flight_payloads(html: str) -> list[str]:
     return [decode_js_string(chunk) for chunk in PUSH_RE.findall(html)]
 
 
+def flight_rows(payloads: list[str]) -> list[str]:
+    """Flatten flight push chunks into individual ``id:json`` rows.
+
+    Older saves push one row per chunk; newer ones (like current arena.ai)
+    pack several newline-separated rows into a single chunk. Row boundaries
+    are newline-delimited either way, so splitting every chunk on newlines
+    yields one flat row list for both formats.
+    """
+    rows: list[str] = []
+    for payload in payloads:
+        rows.extend(payload.splitlines())
+    return rows
+
+
 def text_chunk_table(payloads: list[str]) -> dict[str, str]:
+    """Map ``$id`` text-chunk references to their text.
+
+    Older saves push the marker and its (possibly multi-line) text as two
+    separate chunks; newer ones pack several rows into a single chunk. Scan
+    both views so either format resolves.
+    """
+    rows = flight_rows(payloads)
     table: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        match = T_STRING_RE.fullmatch(row.strip())
+        if match and index + 1 < len(rows):
+            table[match.group(1)] = rows[index + 1]
     for index, payload in enumerate(payloads):
         match = T_STRING_RE.fullmatch(payload.strip())
         if match and index + 1 < len(payloads):
@@ -125,11 +151,11 @@ def is_model_catalog(obj: Any) -> bool:
     )
 
 
-def conversation_state(payloads: list[str]) -> dict[str, Any]:
-    for payload in payloads:
-        if '"messages"' not in payload or '"role"' not in payload:
+def conversation_state(rows: list[str]) -> dict[str, Any]:
+    for row in rows:
+        if '"messages"' not in row or '"role"' not in row:
             continue
-        parsed = json_after_flight_id(payload)
+        parsed = json_after_flight_id(row)
         if parsed is None:
             continue
         found = walk_find(parsed, is_conversation_state)
@@ -148,12 +174,12 @@ def conversation_state(payloads: list[str]) -> dict[str, Any]:
     )
 
 
-def model_names(payloads: list[str]) -> dict[str, str]:
+def model_names(rows: list[str]) -> dict[str, str]:
     names: dict[str, str] = {}
-    for payload in payloads:
-        if '"initialModels"' not in payload:
+    for row in rows:
+        if '"initialModels"' not in row:
             continue
-        parsed = json_after_flight_id(payload)
+        parsed = json_after_flight_id(row)
         if parsed is None:
             continue
         catalog = walk_find(parsed, is_model_catalog)
@@ -169,7 +195,8 @@ def model_names(payloads: list[str]) -> dict[str, str]:
                 or model.get("name")
                 or model_id
             )
-        break
+        if names:
+            break
     return names
 
 
@@ -203,6 +230,32 @@ def attachments_markdown(message: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def reasoning_text(message: dict[str, Any], chunks: dict[str, str]) -> str:
+    """Return the message's reasoning (thought process) text, if any.
+
+    Handles plain strings, ``$id`` references into the flight text chunks, and
+    the rare list-of-blocks shape (blocks with a ``text`` key).
+    """
+    value = message.get("reasoning")
+    if isinstance(value, list):
+        value = "\n\n".join(
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    if not isinstance(value, str):
+        return ""
+    return resolve_content(value, chunks).strip()
+
+
+def reasoning_block(thought: str) -> str:
+    """Render reasoning as a labelled blockquote, shown above the final reply."""
+    quoted = "\n".join(
+        ">" if not line.strip() else f"> {line}" for line in thought.splitlines()
+    )
+    return f"**Thought process**\n\n{quoted}"
+
+
 def source_url(html: str, saved_from: str | None, state: dict[str, Any]) -> str | None:
     if saved_from:
         return saved_from
@@ -233,6 +286,7 @@ def to_markdown(
     chunks: dict[str, str],
     names: dict[str, str],
     url: str | None,
+    keep_reasoning: bool = False,
 ) -> str:
     header: list[str] = []
     title = (state.get("title") or "Arena chat").strip().splitlines()[0]
@@ -264,6 +318,10 @@ def to_markdown(
         block = f"## {heading}\n\n"
         if files:
             block += files + "\n"
+        if keep_reasoning and role == "assistant":
+            thought = reasoning_text(message, chunks)
+            if thought:
+                block += reasoning_block(thought) + "\n\n"
         if body:
             block += body + "\n"
         turns.append(block.rstrip())
@@ -272,7 +330,9 @@ def to_markdown(
     return "\n\n---\n\n".join(parts).rstrip() + "\n"
 
 
-def html_to_markdown(raw: str) -> tuple[str, dict[str, int]]:
+def html_to_markdown(
+    raw: str, keep_reasoning: bool = False
+) -> tuple[str, dict[str, int]]:
     saved_from = extract_saved_from_url(raw)
     html = unwrap_chrome_view_source(raw) if looks_like_view_source(raw) else raw
     if saved_from is None:
@@ -284,17 +344,23 @@ def html_to_markdown(raw: str) -> tuple[str, dict[str, int]]:
             "No arena.ai chat payload found. Upload a saved Direct chat HTML file."
         )
 
+    rows = flight_rows(payloads)
     chunks = text_chunk_table(payloads)
-    state = conversation_state(payloads)
-    names = model_names(payloads)
+    state = conversation_state(rows)
+    names = model_names(rows)
     url = source_url(html, saved_from, state)
     messages = chat_messages(state.get("messages") or [])
-    markdown = to_markdown(state, chunks, names, url)
+    markdown = to_markdown(state, chunks, names, url, keep_reasoning)
     stats = {
         "user_messages": sum(1 for message in messages if message.get("role") == "user"),
         "assistant_messages": sum(
             1 for message in messages if message.get("role") == "assistant"
         ),
         "comparison_turns": comparison_turn_count(messages),
+        "reasoning_messages": sum(
+            1
+            for message in messages
+            if message.get("role") == "assistant" and reasoning_text(message, chunks)
+        ),
     }
     return markdown, stats

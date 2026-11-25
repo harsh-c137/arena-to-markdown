@@ -77,6 +77,7 @@ st.markdown(
 <ul>
   <li>Upload <strong>"Direct"</strong> chats only. No "Side by Side", "Agent Mode" or "Battle Mode" chats yet</li>
   <li>If Arena slipped a random two-model comparison into a Direct chat, both replies are kept and labeled A and B</li>
+  <li>Keep or drop the model's thought process (reasoning) with the checkbox below</li>
 </ul>
 </div>
     """,
@@ -91,11 +92,10 @@ source = st.radio(
 
 if st.session_state.get("input_mode") != source:
     st.session_state.input_mode = source
-    st.session_state.export = None
+    st.session_state.input_raw = None
 
 raw: str | None = None
 download_name = "arena-chat.md"
-should_convert = False
 
 if source == "Upload HTML file":
     uploaded = st.file_uploader(
@@ -110,7 +110,9 @@ if source == "Upload HTML file":
             st.error("Could not read that file as UTF-8 text.")
             st.stop()
         download_name = f"{Path(uploaded.name).stem or 'arena-chat'}.md"
-        should_convert = True
+    else:
+        # Upload removed: drop the last conversion for good.
+        st.session_state.input_raw = None
 else:
     pasted = st.text_area(
         "Paste the page source here",
@@ -122,28 +124,27 @@ else:
         if not raw:
             st.error("Paste the source code first.")
             st.stop()
-        should_convert = True
 
-if should_convert and raw is not None:
-    try:
-        markdown, stats = html_to_markdown(raw)
-    except ValueError as exc:
-        st.session_state.export = None
-        st.error(str(exc))
-        st.stop()
-    st.session_state.export = {
-        "markdown": markdown,
-        "stats": stats,
-        "name": download_name,
-    }
+keep_reasoning = st.checkbox(
+    "Include the model's thought process (reasoning)",
+    help="Model replies on Arena can come with their chain of thought. "
+    "Keep it in the Markdown or export only the final answers.",
+)
 
-export = st.session_state.get("export")
-if not export:
+# Paste mode only sets raw on the Convert click, so fall back to the last
+# committed source. This keeps the export in sync when the checkbox changes.
+if raw is None:
+    raw = st.session_state.get("input_raw")
+if raw is None:
     st.stop()
+st.session_state.input_raw = raw
 
-markdown = export["markdown"]
-stats = export["stats"]
-download_name = export["name"]
+try:
+    markdown, stats = html_to_markdown(raw, keep_reasoning=keep_reasoning)
+except ValueError as exc:
+    st.session_state.input_raw = None
+    st.error(str(exc))
+    st.stop()
 
 st.success(
     f"Extracted **{stats['user_messages']}** of your messages and "
@@ -155,6 +156,17 @@ if stats["comparison_turns"]:
         f"{'turn' if stats['comparison_turns'] == 1 else 'turns'}. "
         "Both replies were kept."
     )
+if stats["reasoning_messages"]:
+    if keep_reasoning:
+        st.info(
+            f"Kept the thought process of **{stats['reasoning_messages']}** model "
+            "replies. Uncheck the box above to drop it."
+        )
+    else:
+        st.info(
+            f"**{stats['reasoning_messages']}** model replies had a thought "
+            "process, which was left out. Check the box above to include it."
+        )
 
 st.download_button(
     label="Download Markdown",
